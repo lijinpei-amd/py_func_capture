@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "func-capture"
+version = "0.1.0"
+description = "Opt-in function instrumentation through FUNC_CAPTURE."
+requires-python = ">=3.9"
+
+[tool.setuptools.packages.find]
+include = ["func_capture*"]
