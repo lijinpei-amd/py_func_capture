@@ -102,6 +102,48 @@ def instrument(func):
 
         self.assertEqual(decorated(), "wrapped:value")
 
+    def test_instrument_arguments_are_forwarded(self) -> None:
+        script = self._write_script(
+            """
+def instrument(func, prefix, *, suffix="", uppercase=False):
+    def wrapper(*args, **kwargs):
+        value = f"{prefix}:{func(*args, **kwargs)}{suffix}"
+        return value.upper() if uppercase else value
+    return wrapper
+"""
+        )
+        os.environ["FUNC_CAPTURE"] = f"chosen={script}"
+
+        def target() -> str:
+            return "value"
+
+        decorated = capture("chosen", "wrapped", suffix="!", uppercase=True)(target)
+
+        self.assertEqual(decorated(), "WRAPPED:VALUE!")
+
+    def test_instrument_args_and_kwargs_can_be_named(self) -> None:
+        script = self._write_script(
+            """
+def instrument(func, prefix, *, suffix=""):
+    def wrapper(*args, **kwargs):
+        return f"{prefix}:{func(*args, **kwargs)}{suffix}"
+    return wrapper
+"""
+        )
+
+        def target() -> str:
+            return "value"
+
+        key = f"{target.__module__}.{target.__qualname__}"
+        os.environ["FUNC_CAPTURE"] = f"{key}={script}"
+
+        decorated = capture(
+            instrument_args=("named",),
+            instrument_kwargs={"suffix": "?"},
+        )(target)
+
+        self.assertEqual(decorated(), "named:value?")
+
     def test_missing_instrument_function_is_an_error_for_matching_function(self) -> None:
         script = self._write_script("VALUE = 1\n")
 

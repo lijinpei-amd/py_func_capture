@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 import hashlib
 import io
 import json
@@ -13,32 +14,58 @@ import types
 from typing import Any, Callable, Optional, TypeVar, Union, cast, overload
 
 F = TypeVar("F", bound=Callable[..., Any])
+Instrument = Callable[..., Any]
 
 ENV_VAR = "FUNC_CAPTURE"
 
 
 @overload
-def capture(func: F, *, key: Optional[str] = None, env_var: str = ENV_VAR) -> F:
+def capture(
+    func: F,
+    *instrument_positional_args: Any,
+    key: Optional[str] = None,
+    env_var: str = ENV_VAR,
+    instrument_args: Optional[Iterable[Any]] = None,
+    instrument_kwargs: Optional[Mapping[str, Any]] = None,
+    **instrument_keyword_args: Any,
+) -> F:
     ...
 
 
 @overload
 def capture(
-    func: None = None, *, key: Optional[str] = None, env_var: str = ENV_VAR
+    func: None = None,
+    *instrument_positional_args: Any,
+    key: Optional[str] = None,
+    env_var: str = ENV_VAR,
+    instrument_args: Optional[Iterable[Any]] = None,
+    instrument_kwargs: Optional[Mapping[str, Any]] = None,
+    **instrument_keyword_args: Any,
 ) -> Callable[[F], F]:
     ...
 
 
 @overload
-def capture(func: str, *, key: None = None, env_var: str = ENV_VAR) -> Callable[[F], F]:
+def capture(
+    func: str,
+    *instrument_positional_args: Any,
+    key: None = None,
+    env_var: str = ENV_VAR,
+    instrument_args: Optional[Iterable[Any]] = None,
+    instrument_kwargs: Optional[Mapping[str, Any]] = None,
+    **instrument_keyword_args: Any,
+) -> Callable[[F], F]:
     ...
 
 
 def capture(
     func: Union[F, str, None] = None,
-    *,
+    *instrument_positional_args: Any,
     key: Optional[str] = None,
     env_var: str = ENV_VAR,
+    instrument_args: Optional[Iterable[Any]] = None,
+    instrument_kwargs: Optional[Mapping[str, Any]] = None,
+    **instrument_keyword_args: Any,
 ) -> Union[F, Callable[[F], F]]:
     """Decorate a function with instrumentation selected by an environment var.
 
@@ -49,6 +76,12 @@ def capture(
     Function keys are matched against ``module.qualname`` first, then
     ``qualname``, and ``name``. An explicit key may be supplied
     as ``@capture("my.key")`` or ``@capture(key="my.key")``.
+
+    Extra positional and keyword arguments are passed to the loaded
+    ``instrument`` callable after the target function, allowing
+    ``instrument(func, *args, **kwargs)`` scripts to expose custom behavior.
+    Use ``instrument_args``/``instrument_kwargs`` when decorator syntax makes
+    positional forwarding ambiguous.
     """
 
     if isinstance(func, str):
@@ -70,8 +103,17 @@ def capture(
         if script_path is None:
             return target
 
+        forwarded_args = _forwarded_instrument_args(
+            instrument_positional_args,
+            instrument_args=instrument_args,
+        )
+        forwarded_kwargs = _forwarded_instrument_kwargs(
+            instrument_kwargs,
+            instrument_keyword_args,
+        )
+
         instrument = _load_instrument(script_path)
-        instrumented = instrument(target)
+        instrumented = instrument(target, *forwarded_args, **forwarded_kwargs)
         if not callable(instrumented):
             raise TypeError(
                 f"instrument() in {script_path!r} returned a non-callable "
@@ -87,6 +129,44 @@ def capture(
 
 
 func_capture = capture
+
+
+def _forwarded_instrument_args(
+    positional_args: tuple[Any, ...],
+    *,
+    instrument_args: Optional[Iterable[Any]],
+) -> tuple[Any, ...]:
+    if instrument_args is None:
+        return positional_args
+    try:
+        return positional_args + tuple(instrument_args)
+    except TypeError as exc:
+        raise TypeError("capture() instrument_args must be iterable") from exc
+
+
+def _forwarded_instrument_kwargs(
+    instrument_kwargs: Optional[Mapping[str, Any]],
+    keyword_args: dict[str, Any],
+) -> dict[str, Any]:
+    if instrument_kwargs is None:
+        return dict(keyword_args)
+    if not isinstance(instrument_kwargs, Mapping):
+        raise TypeError("capture() instrument_kwargs must be a mapping")
+
+    duplicate_keys = set(instrument_kwargs).intersection(keyword_args)
+    if duplicate_keys:
+        duplicates = ", ".join(sorted(repr(key) for key in duplicate_keys))
+        raise TypeError(
+            f"capture() got duplicate instrument keyword argument(s): {duplicates}"
+        )
+
+    forwarded = dict(instrument_kwargs)
+    forwarded.update(keyword_args)
+    non_string_keys = [key for key in forwarded if not isinstance(key, str)]
+    if non_string_keys:
+        keys = ", ".join(sorted(repr(key) for key in non_string_keys))
+        raise TypeError(f"capture() instrument keyword names must be strings; got {keys}")
+    return forwarded
 
 
 def _parse_capture_spec(spec: str, *, env_var: str = ENV_VAR) -> dict[str, str]:
@@ -229,7 +309,7 @@ def _function_key(func: Callable[..., Any]) -> str:
     return repr(func)
 
 
-def _load_instrument(script_path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+def _load_instrument(script_path: str) -> Instrument:
     expanded = Path(os.path.expandvars(script_path)).expanduser()
     return _load_instrument_from_file(str(expanded.resolve()))
 
@@ -237,12 +317,12 @@ def _load_instrument(script_path: str) -> Callable[[Callable[..., Any]], Callabl
 # Cache loaded instrument callables per resolved script path. The source bytes
 # are hashed so edited scripts reload even when filesystem timestamp precision
 # or Python bytecode caches would otherwise hide the change.
-_INSTRUMENT_CACHE: dict[str, tuple[str, Callable[..., Any]]] = {}
+_INSTRUMENT_CACHE: dict[str, tuple[str, Instrument]] = {}
 
 
 def _load_instrument_from_file(
     resolved_script_path: str,
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+) -> Instrument:
     script = Path(resolved_script_path)
     if not script.is_file():
         raise FileNotFoundError(f"instrumentation script not found: {script}")
@@ -277,4 +357,4 @@ def _load_instrument_from_file(
         raise AttributeError(f"instrumentation script {script} has no callable instrument()")
 
     _INSTRUMENT_CACHE[resolved_script_path] = (source_hash, instrument)
-    return cast(Callable[[Callable[..., Any]], Callable[..., Any]], instrument)
+    return cast(Instrument, instrument)
