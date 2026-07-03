@@ -6,16 +6,31 @@ This file is an instrumentation script for ``func_capture.capture``. Example:
     export FUNC_CAPTURE_OUTPUT_DIR=/tmp/func_capture
     export FUNC_CAPTURE_FULL_EVERY_N=100
 
-For every call, the wrapper appends a JSONL record containing non-tensor
-arguments and tensor metadata. Every ``FUNC_CAPTURE_FULL_EVERY_N`` calls, it
-also writes a ``.pt`` snapshot of the pre-call positional and keyword arguments
-with tensors copied to CPU.
+Or pass a YAML config path through ``func_capture.capture``:
+
+    @capture("my.function", config_path="/path/to/tensor_capture.yaml")
+
+Example YAML:
+
+    capture:
+      mode: metadata_and_tensors  # metadata | metadata_and_tensors
+      frequency: 100
+
+By default, the wrapper appends a JSONL record containing non-tensor arguments
+and tensor metadata for every call, buffering those records in memory and
+flushing them to disk periodically. Every ``FUNC_CAPTURE_FULL_EVERY_N`` calls,
+it also writes a ``.pt`` snapshot of the pre-call positional and keyword
+arguments with tensors copied to CPU. A YAML config can switch to metadata-only
+capture or capture metadata plus tensor contents on a different call frequency.
+Send ``SIGUSR1`` to reload active configs and ``SIGUSR2`` to flush buffered
+metadata records immediately.
 """
 
 from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+import atexit
 import functools
 import importlib
 import inspect
@@ -24,22 +39,28 @@ import os
 from pathlib import Path
 import pickle
 import re
+import signal
 import threading
 import time
 import warnings
+from types import FrameType
 from typing import Any, Callable, Mapping, Optional, TypeVar, Union, cast
+import weakref
 
 F = TypeVar("F", bound=Callable[..., Any])
 
 OUTPUT_DIR_ENV = "FUNC_CAPTURE_OUTPUT_DIR"
 FULL_EVERY_N_ENV = "FUNC_CAPTURE_FULL_EVERY_N"
 STRICT_ENV = "FUNC_CAPTURE_STRICT"
+CONFIG_PATH_ENV = "FUNC_CAPTURE_CONFIG"
 
 DEFAULT_OUTPUT_DIR = "func_capture_out"
 # Writing a full ``.pt`` snapshot copies every tensor argument to CPU, so a
 # snapshot on *every* call would cripple a hot kernel. Default to an occasional
 # snapshot; callers opt into denser capture via ``FUNC_CAPTURE_FULL_EVERY_N``.
 DEFAULT_FULL_EVERY_N = 100
+DEFAULT_METADATA_EVERY_N = 1
+DEFAULT_METADATA_FLUSH_INTERVAL_SECONDS = 1.0
 
 # Guard the recursive argument walkers against pathological inputs (reference
 # cycles or extremely deep nesting) so instrumentation never blows the stack.
@@ -56,17 +77,21 @@ SET_MARKER = "__func_capture_set_v1__"
 @dataclass(frozen=True)
 class CaptureConfig:
     output_dir: Path
+    metadata_every_n: int
     full_every_n: int
     strict: bool
 
 
-def instrument(func: F) -> F:
+def instrument(
+    func: F,
+    config_path: Optional[Union[os.PathLike[str], str]] = None,
+) -> F:
     """Wrap ``func`` with tensor-aware capture instrumentation."""
 
     try:
-        config = _read_config()
+        config = _read_config(config_path)
     except Exception as exc:
-        if _strict_requested_after_config_error():
+        if _strict_requested_after_config_error(config_path):
             raise
         # Instrumentation must never take down the program it observes. A bad
         # environment value degrades to a no-op wrapper with a warning.
@@ -78,59 +103,94 @@ def instrument(func: F) -> F:
         return func
 
     function_key = _function_key(func)
-    capture_dir = config.output_dir / _safe_path_name(function_key)
-    full_dir = capture_dir / "full"
 
     try:
         signature = inspect.signature(func)
     except (TypeError, ValueError):
         signature = None
 
-    # State that must not be shared across processes: a forked worker inherits
-    # the parent's pid-derived paths, lock, and call counter, which would
-    # interleave JSONL lines and clobber ``.pt`` snapshots. Keyed by pid and
-    # rebuilt whenever the current pid changes (i.e. after a fork).
-    process_local: dict[str, Any] = {}
-
-    def _process_local() -> tuple[int, Path, threading.Lock, dict[str, int]]:
-        pid = os.getpid()
-        if process_local.get("pid") != pid:
-            process_local["pid"] = pid
-            process_local["records_path"] = capture_dir / f"calls.{pid}.jsonl"
-            process_local["lock"] = threading.Lock()
-            process_local["state"] = {"call_index": 0}
-            capture_dir.mkdir(parents=True, exist_ok=True)
-            if config.full_every_n > 0:
-                full_dir.mkdir(parents=True, exist_ok=True)
-        return (
-            process_local["pid"],
-            process_local["records_path"],
-            process_local["lock"],
-            process_local["state"],
-        )
-
-    # Initialise eagerly so the common (no-fork) path never races on rebuild.
-    _process_local()
+    runtime = _CaptureRuntime(
+        func=func,
+        function_key=function_key,
+        signature=signature,
+        config_path=config_path,
+        config=config,
+    )
 
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        pid, records_path, lock, state = _process_local()
+        runtime.capture(args, kwargs)
+        return func(*args, **kwargs)
 
-        with lock:
-            state["call_index"] += 1
-            call_index = state["call_index"]
+    return cast(F, wrapper)
+
+
+class _CaptureRuntime:
+    def __init__(
+        self,
+        *,
+        func: Callable[..., Any],
+        function_key: str,
+        signature: Optional[inspect.Signature],
+        config_path: Optional[Union[os.PathLike[str], str]],
+        config: CaptureConfig,
+    ) -> None:
+        self.func = func
+        self.function_key = function_key
+        self.signature = signature
+        self.config_path = config_path
+        self._config = config
+        self._safe_name = _safe_path_name(function_key)
+        self._lock = threading.RLock()
+        # Serialises the actual JSONL writes so a background-flusher write and an
+        # on-demand (SIGUSR2/atexit) flush of the same file cannot interleave and
+        # tear lines. Kept separate from ``_lock`` so slow disk I/O never blocks
+        # the hot path that only buffers records. Reentrant so a re-entrant flush
+        # on the same thread cannot self-deadlock.
+        self._io_lock = threading.RLock()
+        self._pid: Optional[int] = None
+        self._call_index = 0
+        self._capture_dir: Optional[Path] = None
+        self._full_dir: Optional[Path] = None
+        self._records_path: Optional[Path] = None
+        self._record_buffers: dict[Path, list[Mapping[str, Any]]] = {}
+        self._flush_event = threading.Event()
+        self._flusher_thread: Optional[threading.Thread] = None
+        self._flusher_pid: Optional[int] = None
+        self._last_flush_error: Optional[str] = None
+
+        with self._lock:
+            self._ensure_process_locked()
+            self._start_flusher_thread_locked()
+        _register_capture_state(self)
+
+    def capture(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        with self._lock:
+            self._ensure_process_locked()
+            self._start_flusher_thread_locked()
+            config = self._config
+            if config.metadata_every_n == 0 and config.full_every_n == 0:
+                return
+
+            self._call_index += 1
+            call_index = self._call_index
+            pid = self._require_pid_locked()
+            records_path = self._require_records_path_locked()
+            capture_dir = self._require_capture_dir_locked()
+            full_dir = self._require_full_dir_locked()
 
         full_capture: Optional[dict[str, Any]] = None
         capture_error: Optional[dict[str, str]] = None
 
-        if config.full_every_n > 0 and call_index % config.full_every_n == 0:
+        if _captures_call(config.full_every_n, call_index):
             full_name = f"call_{pid}_{call_index:09d}.pt"
             full_path = full_dir / full_name
             try:
+                full_dir.mkdir(parents=True, exist_ok=True)
                 _save_full_call(
                     full_path,
-                    func=func,
-                    function_key=function_key,
+                    func=self.func,
+                    function_key=self.function_key,
                     call_index=call_index,
                     args=args,
                     kwargs=kwargs,
@@ -144,43 +204,397 @@ def instrument(func: F) -> F:
                 if config.strict:
                     raise
 
-        try:
-            record = _call_record(
-                func=func,
-                function_key=function_key,
-                signature=signature,
-                call_index=call_index,
-                args=args,
-                kwargs=kwargs,
-                full_capture=full_capture,
-                capture_error=capture_error,
-            )
-            _append_jsonl(records_path, record, lock)
-        except Exception as exc:  # pragma: no cover - strict mode re-raises.
-            if config.strict:
-                raise
-            # Best-effort error record; a failure here (e.g. a full disk) must
-            # not escape and break the wrapped function in non-strict mode.
+        if (
+            _captures_call(config.metadata_every_n, call_index)
+            or full_capture is not None
+            or capture_error is not None
+        ):
             try:
-                _append_jsonl(
-                    records_path,
-                    {
-                        "version": FORMAT_VERSION,
-                        "event": "capture_error",
-                        "function": function_key,
-                        "call_index": call_index,
-                        "time_ns": time.time_ns(),
-                        "process_id": pid,
-                        "error": _error_record(exc),
-                    },
-                    lock,
+                record = _call_record(
+                    func=self.func,
+                    function_key=self.function_key,
+                    signature=self.signature,
+                    call_index=call_index,
+                    args=args,
+                    kwargs=kwargs,
+                    full_capture=full_capture,
+                    capture_error=capture_error,
                 )
-            except Exception:
-                pass
+                self.buffer_record(records_path, record)
+            except Exception as exc:  # pragma: no cover - strict mode re-raises.
+                if config.strict:
+                    raise
+                # Best-effort error record; failures while buffering must not
+                # escape and break the wrapped function in non-strict mode.
+                try:
+                    self.buffer_record(
+                        records_path,
+                        {
+                            "version": FORMAT_VERSION,
+                            "event": "capture_error",
+                            "function": self.function_key,
+                            "call_index": call_index,
+                            "time_ns": time.time_ns(),
+                            "process_id": pid,
+                            "error": _error_record(exc),
+                        },
+                    )
+                except Exception:
+                    pass
 
-        return func(*args, **kwargs)
+    def buffer_record(self, path: Path, record: Mapping[str, Any]) -> None:
+        with self._lock:
+            self._record_buffers.setdefault(path, []).append(record)
 
-    return cast(F, wrapper)
+    def flush(self) -> None:
+        with self._lock:
+            self._ensure_process_locked()
+            buffers = self._record_buffers
+            self._record_buffers = {}
+
+        if not buffers:
+            return
+
+        failed: dict[Path, list[Mapping[str, Any]]] = {}
+        with self._io_lock:
+            for path, records in buffers.items():
+                try:
+                    _append_jsonl_records(path, records)
+                except Exception as exc:
+                    failed[path] = records
+                    self._warn_flush_error(path, exc)
+
+        if failed:
+            with self._lock:
+                for path, records in failed.items():
+                    existing = self._record_buffers.get(path, [])
+                    self._record_buffers[path] = records + existing
+        else:
+            # Everything landed; allow a future identical error to warn again.
+            with self._lock:
+                self._last_flush_error = None
+
+    def reload_config(self) -> None:
+        try:
+            config = _read_config(self.config_path)
+        except Exception as exc:
+            warnings.warn(
+                f"func_capture: keeping existing capture config for "
+                f"{self.function_key!r}; reload failed: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+
+        with self._lock:
+            self._config = config
+            self._set_paths_locked(os.getpid(), reset_call_index=False)
+            self._start_flusher_thread_locked()
+
+    def _start_flusher_thread_locked(self) -> None:
+        pid = os.getpid()
+        if (
+            self._flusher_pid == pid
+            and self._flusher_thread is not None
+            and self._flusher_thread.is_alive()
+        ):
+            return
+
+        self._flusher_pid = pid
+        self._flusher_thread = threading.Thread(
+            target=_capture_runtime_flush_loop,
+            args=(weakref.ref(self), pid),
+            name=f"func_capture_metadata_flush_{pid}",
+            daemon=True,
+        )
+        self._flusher_thread.start()
+
+    def _ensure_process_locked(self) -> None:
+        pid = os.getpid()
+        if self._pid != pid:
+            # A forked child inherits the parent's in-memory buffers. The child
+            # must not flush the parent's already-captured metadata.
+            self._record_buffers = {}
+            self._set_paths_locked(pid, reset_call_index=True)
+
+    def _set_paths_locked(self, pid: int, *, reset_call_index: bool) -> None:
+        self._pid = pid
+        if reset_call_index:
+            self._call_index = 0
+        self._capture_dir = self._config.output_dir / self._safe_name
+        self._full_dir = self._capture_dir / "full"
+        self._records_path = self._capture_dir / f"calls.{pid}.jsonl"
+        if self._config.metadata_every_n > 0 or self._config.full_every_n > 0:
+            self._capture_dir.mkdir(parents=True, exist_ok=True)
+        if self._config.full_every_n > 0:
+            self._full_dir.mkdir(parents=True, exist_ok=True)
+
+    def _require_pid_locked(self) -> int:
+        if self._pid is None:
+            raise RuntimeError("capture runtime has no process id")
+        return self._pid
+
+    def _require_capture_dir_locked(self) -> Path:
+        if self._capture_dir is None:
+            raise RuntimeError("capture runtime has no capture directory")
+        return self._capture_dir
+
+    def _require_full_dir_locked(self) -> Path:
+        if self._full_dir is None:
+            raise RuntimeError("capture runtime has no full-capture directory")
+        return self._full_dir
+
+    def _require_records_path_locked(self) -> Path:
+        if self._records_path is None:
+            raise RuntimeError("capture runtime has no records path")
+        return self._records_path
+
+    def _warn_flush_error(self, path: Path, exc: Exception) -> None:
+        message = f"{path}: {type(exc).__name__}: {exc}"
+        with self._lock:
+            if self._last_flush_error == message:
+                return
+            self._last_flush_error = message
+        warnings.warn(
+            f"func_capture: failed to flush metadata records for "
+            f"{self.function_key!r}: {message}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+def _capture_runtime_flush_loop(
+    runtime_ref: weakref.ReferenceType[_CaptureRuntime],
+    pid: int,
+) -> None:
+    while True:
+        runtime = runtime_ref()
+        if runtime is None or os.getpid() != pid:
+            return
+        flush_event = runtime._flush_event
+        del runtime
+
+        flush_event.wait(DEFAULT_METADATA_FLUSH_INTERVAL_SECONDS)
+        flush_event.clear()
+
+        runtime = runtime_ref()
+        if runtime is None or os.getpid() != pid:
+            return
+        runtime.flush()
+        del runtime
+
+
+_CAPTURE_STATES: weakref.WeakSet[_CaptureRuntime] = weakref.WeakSet()
+_CAPTURE_STATES_LOCK = threading.RLock()
+_SIGNAL_HANDLERS_LOCK = threading.Lock()
+_PREVIOUS_SIGNAL_HANDLERS: dict[int, Any] = {}
+
+# Signal handlers run on the main thread at (nearly) arbitrary points, so they
+# must not take locks, do I/O, parse YAML, or emit warnings — all of which the
+# reload/flush work does. The handler therefore only records what was asked and
+# wakes a dedicated worker thread that performs the real work at a safe point.
+_SIGNAL_REQUEST_COUNTS = {"reload": 0, "flush": 0}
+_SIGNAL_PROCESSED_COUNTS = {"reload": 0, "flush": 0}
+_SIGNAL_WORK_EVENT = threading.Event()
+_SIGNAL_WORKER_LOCK = threading.Lock()
+_SIGNAL_WORKER_THREAD: Optional[threading.Thread] = None
+_SIGNAL_WORKER_PID: Optional[int] = None
+# Bumped after every dispatch cycle so callers (and tests) can wait for a raised
+# signal to be fully processed instead of racing the worker thread.
+_SIGNAL_DISPATCH_CV = threading.Condition(threading.Lock())
+_SIGNAL_DISPATCH_COUNT = 0
+
+_ATEXIT_REGISTERED = False
+
+
+def _register_capture_state(state: _CaptureRuntime) -> None:
+    with _CAPTURE_STATES_LOCK:
+        _CAPTURE_STATES.add(state)
+    _register_atexit_flush()
+    _install_signal_handlers()
+
+
+def _register_atexit_flush() -> None:
+    # Flush buffered records on clean interpreter exit; the background flusher is
+    # a daemon thread and is killed at shutdown without draining its buffer, so
+    # without this the most recently buffered records (and the JSONL entries that
+    # point at synchronously-written ``.pt`` snapshots) would be lost.
+    global _ATEXIT_REGISTERED
+    with _SIGNAL_WORKER_LOCK:
+        if _ATEXIT_REGISTERED:
+            return
+        _ATEXIT_REGISTERED = True
+    atexit.register(_flush_all_capture_states)
+
+
+def _capture_states_snapshot() -> list[_CaptureRuntime]:
+    with _CAPTURE_STATES_LOCK:
+        return list(_CAPTURE_STATES)
+
+
+def _flush_all_capture_states() -> None:
+    for state in _capture_states_snapshot():
+        state.flush()
+
+
+def _reload_all_capture_states() -> None:
+    for state in _capture_states_snapshot():
+        state.reload_config()
+
+
+def _signal_dispatch_loop(pid: int) -> None:
+    global _SIGNAL_DISPATCH_COUNT
+    while True:
+        if os.getpid() != pid:
+            return
+        _SIGNAL_WORK_EVENT.wait()
+        if os.getpid() != pid:
+            return
+        while True:
+            # Clear before reading the counters: a signal that arrives after
+            # this point re-sets the event. Counters make that signal visible
+            # even if it lands while this worker is dispatching older work.
+            _SIGNAL_WORK_EVENT.clear()
+            reload_count = _SIGNAL_REQUEST_COUNTS["reload"]
+            flush_count = _SIGNAL_REQUEST_COUNTS["flush"]
+            do_reload = reload_count > _SIGNAL_PROCESSED_COUNTS["reload"]
+            do_flush = flush_count > _SIGNAL_PROCESSED_COUNTS["flush"]
+
+            if do_reload:
+                _reload_all_capture_states()
+                _SIGNAL_PROCESSED_COUNTS["reload"] = reload_count
+            if do_flush:
+                _flush_all_capture_states()
+                _SIGNAL_PROCESSED_COUNTS["flush"] = flush_count
+
+            with _SIGNAL_DISPATCH_CV:
+                _SIGNAL_DISPATCH_COUNT += 1
+                _SIGNAL_DISPATCH_CV.notify_all()
+
+            if (
+                _SIGNAL_REQUEST_COUNTS["reload"]
+                == _SIGNAL_PROCESSED_COUNTS["reload"]
+                and _SIGNAL_REQUEST_COUNTS["flush"]
+                == _SIGNAL_PROCESSED_COUNTS["flush"]
+            ):
+                break
+
+
+def _ensure_signal_dispatcher() -> None:
+    global _SIGNAL_WORKER_THREAD, _SIGNAL_WORKER_PID
+    pid = os.getpid()
+    with _SIGNAL_WORKER_LOCK:
+        if (
+            _SIGNAL_WORKER_PID == pid
+            and _SIGNAL_WORKER_THREAD is not None
+            and _SIGNAL_WORKER_THREAD.is_alive()
+        ):
+            return
+        _SIGNAL_WORKER_PID = pid
+        _SIGNAL_WORKER_THREAD = threading.Thread(
+            target=_signal_dispatch_loop,
+            args=(pid,),
+            name=f"func_capture_signal_dispatch_{pid}",
+            daemon=True,
+        )
+        _SIGNAL_WORKER_THREAD.start()
+
+
+def _signal_dispatch_count() -> int:
+    with _SIGNAL_DISPATCH_CV:
+        return _SIGNAL_DISPATCH_COUNT
+
+
+def _wait_for_signal_dispatch(previous_count: int, timeout: float) -> bool:
+    with _SIGNAL_DISPATCH_CV:
+        return _SIGNAL_DISPATCH_CV.wait_for(
+            lambda: _SIGNAL_DISPATCH_COUNT > previous_count,
+            timeout=timeout,
+        )
+
+
+def _install_signal_handlers() -> None:
+    signal_numbers = _capture_signal_numbers()
+    if not signal_numbers:
+        return
+    with _SIGNAL_HANDLERS_LOCK:
+        for signum in signal_numbers:
+            if signum in _PREVIOUS_SIGNAL_HANDLERS:
+                continue
+            try:
+                previous = signal.getsignal(signum)
+                signal.signal(signum, _handle_capture_signal)
+            except (OSError, ValueError, AttributeError):
+                # signal.signal only works on the main thread; degrade quietly.
+                continue
+            _PREVIOUS_SIGNAL_HANDLERS[signum] = previous
+    _ensure_signal_dispatcher()
+
+
+def _capture_signal_numbers() -> tuple[int, ...]:
+    numbers: list[int] = []
+    for name in ("SIGUSR1", "SIGUSR2"):
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            numbers.append(int(signum))
+    return tuple(numbers)
+
+
+def _handle_capture_signal(signum: int, frame: Optional[FrameType]) -> None:
+    # Keep the Python signal handler minimal: record the request and wake the
+    # worker thread that performs lock-taking, I/O, YAML parsing, and warnings.
+    if signum == int(getattr(signal, "SIGUSR1", -1)):
+        _SIGNAL_REQUEST_COUNTS["reload"] += 1
+    elif signum == int(getattr(signal, "SIGUSR2", -1)):
+        _SIGNAL_REQUEST_COUNTS["flush"] += 1
+    _SIGNAL_WORK_EVENT.set()
+
+    previous = _PREVIOUS_SIGNAL_HANDLERS.get(signum)
+    if callable(previous) and previous is not _handle_capture_signal:
+        previous(signum, frame)
+
+
+def _reset_capture_state_after_fork_in_child() -> None:
+    # Only the forking thread survives into the child, so any lock another thread
+    # (the flusher or signal worker) held at fork time is inherited locked and
+    # would deadlock the child. Replace every lock with a fresh one and drop the
+    # stale helper-thread handles; the per-runtime pid check rebuilds paths and
+    # restarts threads on the next call.
+    global _CAPTURE_STATES_LOCK, _SIGNAL_HANDLERS_LOCK, _SIGNAL_WORKER_LOCK
+    global _SIGNAL_WORK_EVENT, _SIGNAL_WORKER_THREAD, _SIGNAL_WORKER_PID
+    global _SIGNAL_DISPATCH_CV, _SIGNAL_DISPATCH_COUNT
+
+    _CAPTURE_STATES_LOCK = threading.RLock()
+    _SIGNAL_HANDLERS_LOCK = threading.Lock()
+    _SIGNAL_WORKER_LOCK = threading.Lock()
+    _SIGNAL_WORK_EVENT = threading.Event()
+    _SIGNAL_WORKER_THREAD = None
+    _SIGNAL_WORKER_PID = None
+    _SIGNAL_DISPATCH_CV = threading.Condition(threading.Lock())
+    _SIGNAL_DISPATCH_COUNT = 0
+    _SIGNAL_REQUEST_COUNTS["reload"] = 0
+    _SIGNAL_REQUEST_COUNTS["flush"] = 0
+    _SIGNAL_PROCESSED_COUNTS["reload"] = 0
+    _SIGNAL_PROCESSED_COUNTS["flush"] = 0
+
+    states = list(_CAPTURE_STATES)
+    for state in states:
+        state._lock = threading.RLock()
+        state._io_lock = threading.RLock()
+        state._flush_event = threading.Event()
+        state._flusher_thread = None
+        state._flusher_pid = None
+        state._record_buffers = {}
+        state._pid = None
+
+    if states:
+        _ensure_signal_dispatcher()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        after_in_child=_reset_capture_state_after_fork_in_child,
+    )
 
 
 def load_full_call(
@@ -230,33 +644,286 @@ def replay_full_call(
     return func(*args, **kwargs)
 
 
-def _read_config() -> CaptureConfig:
+_MISSING = object()
+
+
+def _read_config(
+    config_path: Optional[Union[os.PathLike[str], str]] = None,
+) -> CaptureConfig:
     output_dir = Path(os.environ.get(OUTPUT_DIR_ENV, DEFAULT_OUTPUT_DIR)).expanduser()
     strict = _env_bool(STRICT_ENV, default=False)
     full_every_n = _env_int(FULL_EVERY_N_ENV, DEFAULT_FULL_EVERY_N)
-    if full_every_n < 0:
-        raise ValueError(f"{FULL_EVERY_N_ENV} must be >= 0")
-    return CaptureConfig(
+    config = CaptureConfig(
         output_dir=output_dir,
+        metadata_every_n=DEFAULT_METADATA_EVERY_N,
         full_every_n=full_every_n,
         strict=strict,
     )
+
+    effective_config_path = config_path
+    if effective_config_path is None:
+        env_config_path = os.environ.get(CONFIG_PATH_ENV)
+        if env_config_path is not None and env_config_path.strip():
+            effective_config_path = env_config_path
+
+    if effective_config_path is not None:
+        config = _apply_yaml_config(config, _expand_path(effective_config_path))
+
+    _validate_capture_interval("metadata_every_n", config.metadata_every_n)
+    _validate_capture_interval(FULL_EVERY_N_ENV, config.full_every_n)
+    return config
+
+
+def _apply_yaml_config(base: CaptureConfig, path: Path) -> CaptureConfig:
+    root = _load_yaml_mapping(path)
+    capture_section = _optional_mapping(root, "capture")
+
+    output_dir = base.output_dir
+    output_dir_value = _config_value(root, {}, ("output_dir",))
+    if output_dir_value is not _MISSING:
+        output_dir = _expand_path(_config_path_value(output_dir_value, "output_dir"))
+
+    strict = base.strict
+    strict_value = _config_value(root, {}, ("strict",))
+    if strict_value is not _MISSING:
+        strict = _coerce_bool(strict_value, "strict")
+
+    metadata_every_n = base.metadata_every_n
+    full_every_n = base.full_every_n
+
+    mode_value = _config_value(root, capture_section, ("mode", "capture_mode"))
+    frequency_value = _config_value(
+        root,
+        capture_section,
+        ("frequency", "every_n", "capture_every_n"),
+    )
+    frequency = (
+        None
+        if frequency_value is _MISSING
+        else _coerce_int(frequency_value, "frequency")
+    )
+
+    if mode_value is not _MISSING:
+        metadata_every_n, full_every_n = _capture_intervals_for_mode(
+            mode_value,
+            frequency=frequency,
+            base=base,
+        )
+    else:
+        metadata_value = _config_value(
+            root,
+            capture_section,
+            ("metadata", "capture_metadata"),
+        )
+        tensor_contents_value = _config_value(
+            root,
+            capture_section,
+            (
+                "tensor_contents",
+                "capture_tensor_contents",
+                "capture_tensors",
+                "tensors",
+                "full",
+            ),
+        )
+
+        if metadata_value is not _MISSING:
+            metadata_every_n = (
+                _frequency_or_default(frequency, base.metadata_every_n)
+                if _coerce_bool(metadata_value, "capture_metadata")
+                else 0
+            )
+        elif frequency is not None:
+            metadata_every_n = frequency
+
+        if tensor_contents_value is not _MISSING:
+            full_every_n = (
+                _frequency_or_default(
+                    frequency, base.full_every_n, fallback=DEFAULT_FULL_EVERY_N
+                )
+                if _coerce_bool(tensor_contents_value, "capture_tensor_contents")
+                else 0
+            )
+        # A bare ``frequency`` only thins the metadata stream; it must not
+        # silently change the (much more expensive) tensor-snapshot cadence,
+        # which stays at whatever the environment/base config selected.
+
+    explicit_metadata_every_n = _config_value(
+        root,
+        capture_section,
+        ("metadata_every_n",),
+    )
+    if explicit_metadata_every_n is not _MISSING:
+        metadata_every_n = _coerce_int(
+            explicit_metadata_every_n,
+            "metadata_every_n",
+        )
+
+    explicit_full_every_n = _config_value(
+        root,
+        capture_section,
+        ("tensor_contents_every_n", "full_every_n"),
+    )
+    if explicit_full_every_n is not _MISSING:
+        full_every_n = _coerce_int(explicit_full_every_n, "full_every_n")
+
+    return CaptureConfig(
+        output_dir=output_dir,
+        metadata_every_n=metadata_every_n,
+        full_every_n=full_every_n,
+        strict=strict,
+    )
+
+
+def _load_yaml_mapping(path: Path) -> Mapping[Any, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"capture config not found: {path}")
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError(
+            "PyYAML is required to read func_capture tensor_args config files"
+        ) from exc
+
+    with path.open("r", encoding="utf-8") as file:
+        loaded = yaml.safe_load(file)
+
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, Mapping):
+        raise ValueError(f"capture config {path} must contain a YAML mapping")
+    return loaded
+
+
+def _optional_mapping(root: Mapping[Any, Any], key: str) -> Mapping[Any, Any]:
+    value = root.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError(f"capture config field {key!r} must be a mapping")
+    return value
+
+
+def _config_value(
+    root: Mapping[Any, Any],
+    capture_section: Mapping[Any, Any],
+    names: tuple[str, ...],
+) -> Any:
+    for source in (capture_section, root):
+        for name in names:
+            if name in source:
+                return source[name]
+    return _MISSING
+
+
+def _capture_intervals_for_mode(
+    value: Any,
+    *,
+    frequency: Optional[int],
+    base: CaptureConfig,
+) -> tuple[int, int]:
+    if value is False:
+        return 0, 0
+    if not isinstance(value, str):
+        raise ValueError(f"capture mode must be a string or false, got {value!r}")
+
+    mode = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if mode in {"metadata", "metadata_only", "meta"}:
+        return _frequency_or_default(frequency, base.metadata_every_n), 0
+    if mode in {
+        "metadata_and_tensors",
+        "metadata_with_tensors",
+        "metadata_plus_tensors",
+        "tensors",
+        "tensor_contents",
+        "full",
+        "all",
+    }:
+        if frequency is None:
+            return (
+                _frequency_or_default(None, base.metadata_every_n),
+                _frequency_or_default(
+                    None, base.full_every_n, fallback=DEFAULT_FULL_EVERY_N
+                ),
+            )
+        return frequency, frequency
+    if mode in {"off", "none", "disabled", "false"}:
+        return 0, 0
+
+    raise ValueError(
+        "capture mode must be one of metadata, metadata_and_tensors, or off; "
+        f"got {value!r}"
+    )
+
+
+def _frequency_or_default(
+    frequency: Optional[int],
+    default: int,
+    *,
+    fallback: int = DEFAULT_METADATA_EVERY_N,
+) -> int:
+    if frequency is not None:
+        return frequency
+    if default > 0:
+        return default
+    # The caller asked to enable a capture stream but neither the config nor the
+    # environment gave a cadence. ``fallback`` lets tensor-snapshot callers land
+    # on the sparse ``DEFAULT_FULL_EVERY_N`` instead of the every-call metadata
+    # default, which would copy every tensor to CPU on a hot path.
+    return fallback
+
+
+def _expand_path(value: Union[os.PathLike[str], str]) -> Path:
+    return Path(os.path.expandvars(os.fspath(value))).expanduser()
+
+
+def _config_path_value(value: Any, name: str) -> Union[os.PathLike[str], str]:
+    if isinstance(value, (str, os.PathLike)):
+        return value
+    raise ValueError(f"{name} must be a path string, got {value!r}")
+
+
+def _captures_call(every_n: int, call_index: int) -> bool:
+    return every_n > 0 and call_index % every_n == 0
+
+
+def _validate_capture_interval(name: str, value: int) -> None:
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0")
 
 
 def _env_int(name: str, default: int) -> int:
     value = os.environ.get(name)
     if value is None or not value.strip():
         return default
-    try:
-        return int(value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+    return _coerce_int(value, name)
 
 
 def _env_bool(name: str, *, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None or not value.strip():
         return default
+    return _coerce_bool(value, name)
+
+
+def _coerce_int(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+    raise ValueError(f"{name} must be an integer, got {value!r}")
+
+
+def _coerce_bool(value: Any, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a boolean, got {value!r}")
     normalized = value.strip().lower()
     if normalized in {"1", "true", "yes", "y", "on"}:
         return True
@@ -265,11 +932,29 @@ def _env_bool(name: str, *, default: bool) -> bool:
     raise ValueError(f"{name} must be a boolean, got {value!r}")
 
 
-def _strict_requested_after_config_error() -> bool:
+def _strict_requested_after_config_error(
+    config_path: Optional[Union[os.PathLike[str], str]] = None,
+) -> bool:
     try:
-        return _env_bool(STRICT_ENV, default=False)
+        if _env_bool(STRICT_ENV, default=False):
+            return True
     except ValueError:
         return True
+    effective_config_path = config_path
+    if effective_config_path is None:
+        env_config_path = os.environ.get(CONFIG_PATH_ENV)
+        if env_config_path is not None and env_config_path.strip():
+            effective_config_path = env_config_path
+    if effective_config_path is None:
+        return False
+    try:
+        root = _load_yaml_mapping(_expand_path(effective_config_path))
+        strict_value = _config_value(root, {}, ("strict",))
+        if strict_value is _MISSING:
+            return False
+        return _coerce_bool(strict_value, "strict")
+    except Exception:
+        return False
 
 
 def _call_record(
@@ -637,12 +1322,22 @@ def _load_snapshot(path: Union[os.PathLike[str], str]) -> Mapping[str, Any]:
 
 
 def _append_jsonl(path: Path, record: Mapping[str, Any], lock: threading.Lock) -> None:
+    with lock:
+        _append_jsonl_records(path, [record])
+
+
+def _append_jsonl_records(path: Path, records: list[Mapping[str, Any]]) -> None:
+    if not records:
+        return
     # Serialise the whole line (including the trailing newline) into a single
     # write so an O_APPEND write stays atomic and lines are never torn.
-    line = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
-    with lock:
-        with path.open("a", encoding="utf-8") as file:
-            file.write(line)
+    payload = "".join(
+        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        for record in records
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as file:
+        file.write(payload)
 
 
 def _is_tensor(value: Any) -> bool:

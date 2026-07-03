@@ -7,6 +7,7 @@ name = "func-capture"
 version = "0.1.0"
 description = "Opt-in function instrumentation through FUNC_CAPTURE."
 requires-python = ">=3.9"
+dependencies = ["PyYAML>=6"]
 
 [tool.setuptools.packages.find]
 include = ["func_capture*"]

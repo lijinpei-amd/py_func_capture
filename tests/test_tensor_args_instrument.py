@@ -6,10 +6,13 @@ import json
 import os
 from pathlib import Path
 import pickle
+import signal
 import sys
 import tempfile
+import time
 import unittest
 
+from func_capture import capture
 from func_capture.instruments import tensor_args
 
 
@@ -208,6 +211,7 @@ class TensorArgsInstrumentTests(unittest.TestCase):
                     "called",
                 )
 
+            tensor_args._flush_all_capture_states()
             record_files = list(Path(temp_dir.name).glob("*/calls.*.jsonl"))
             self.assertEqual(len(record_files), 1)
             records = [
@@ -237,14 +241,364 @@ class TensorArgsInstrumentTests(unittest.TestCase):
             self.assertEqual(kwargs["num_write"], 6)
             self.assertEqual(kwargs["ratio"], 2)
 
+    def test_yaml_config_metadata_only_frequency(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        config_path = Path(temp_dir.name) / "capture.yaml"
+        config_path.write_text(
+            f"""
+output_dir: {temp_dir.name}
+capture:
+  mode: metadata
+  frequency: 2
+""".lstrip(),
+            encoding="utf-8",
+        )
+
+        def target(x):
+            return x
+
+        with fake_torch_module():
+            wrapped = tensor_args.instrument(target, config_path=config_path)
+            wrapped(FakeTensor((1,)))
+            wrapped(FakeTensor((2,)))
+            wrapped(FakeTensor((3,)))
+
+        record_file, records = self._records(temp_dir.name)
+        self.assertEqual([record["call_index"] for record in records], [2])
+        self.assertNotIn("full_capture", records[0])
+        self.assertFalse((record_file.parent / "full").exists())
+
+    def test_yaml_config_captures_tensor_contents_on_frequency(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        config_path = Path(temp_dir.name) / "capture.yaml"
+        config_path.write_text(
+            f"""
+output_dir: {temp_dir.name}
+capture:
+  mode: metadata_and_tensors
+  frequency: 2
+""".lstrip(),
+            encoding="utf-8",
+        )
+
+        def target(x):
+            return x
+
+        with fake_torch_module():
+            wrapped = tensor_args.instrument(target, config_path=config_path)
+            wrapped(FakeTensor((1,)))
+            wrapped(FakeTensor((2,)))
+            wrapped(FakeTensor((3,)))
+
+        record_file, records = self._records(temp_dir.name)
+        self.assertEqual([record["call_index"] for record in records], [2])
+        self.assertIn("full_capture", records[0])
+        full_path = record_file.parent / records[0]["full_capture"]["path"]
+        self.assertTrue(full_path.exists())
+        args, _kwargs = tensor_args.load_full_call(full_path, tensor_device="cpu")
+        self.assertEqual(args[0].shape, (2,))
+
+    def test_config_path_can_be_forwarded_through_capture(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        config_path = Path(temp_dir.name) / "capture.yaml"
+        config_path.write_text(
+            f"""
+output_dir: {temp_dir.name}
+capture:
+  mode: metadata
+  frequency: 2
+""".lstrip(),
+            encoding="utf-8",
+        )
+
+        def target(x):
+            return x
+
+        script_path = Path(tensor_args.__file__).resolve()
+        with fake_torch_module(), patched_env(FUNC_CAPTURE=f"chosen={script_path}"):
+            wrapped = capture("chosen", config_path=config_path)(target)
+            wrapped(FakeTensor((1,)))
+            wrapped(FakeTensor((2,)))
+
+        _record_file, records = self._records(temp_dir.name)
+        self.assertEqual([record["call_index"] for record in records], [2])
+        self.assertNotIn("full_capture", records[0])
+
+    def test_metadata_records_are_buffered_until_flush(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+
+        def target(x):
+            return x
+
+        with fake_torch_module(), patched_env(
+            FUNC_CAPTURE_OUTPUT_DIR=temp_dir.name,
+            FUNC_CAPTURE_FULL_EVERY_N=0,
+        ):
+            wrapped = tensor_args.instrument(target)
+            wrapped(FakeTensor((1,)))
+
+            self.assertEqual(list(Path(temp_dir.name).glob("*/calls.*.jsonl")), [])
+            tensor_args._flush_all_capture_states()
+
+        _record_file, records = self._records(temp_dir.name)
+        self.assertEqual([record["call_index"] for record in records], [1])
+
+    @unittest.skipUnless(
+        hasattr(signal, "SIGUSR2") and hasattr(signal, "raise_signal"),
+        "SIGUSR2 is not available on this platform",
+    )
+    def test_sigusr2_flushes_buffered_metadata(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+
+        def target(x):
+            return x
+
+        with fake_torch_module(), patched_env(
+            FUNC_CAPTURE_OUTPUT_DIR=temp_dir.name,
+            FUNC_CAPTURE_FULL_EVERY_N=0,
+        ):
+            wrapped = tensor_args.instrument(target)
+            wrapped(FakeTensor((1,)))
+
+            self.assertEqual(list(Path(temp_dir.name).glob("*/calls.*.jsonl")), [])
+            before = tensor_args._signal_dispatch_count()
+            signal.raise_signal(signal.SIGUSR2)
+            self.assertTrue(
+                tensor_args._wait_for_signal_dispatch(before, timeout=5.0)
+            )
+
+        record_files = list(Path(temp_dir.name).glob("*/calls.*.jsonl"))
+        self.assertEqual(len(record_files), 1)
+        records = [
+            json.loads(line)
+            for line in record_files[0].read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual([record["call_index"] for record in records], [1])
+
+    @unittest.skipUnless(
+        hasattr(signal, "SIGUSR1") and hasattr(signal, "raise_signal"),
+        "SIGUSR1 is not available on this platform",
+    )
+    def test_sigusr1_reloads_yaml_config(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        config_path = Path(temp_dir.name) / "capture.yaml"
+
+        def write_config(frequency: int) -> None:
+            config_path.write_text(
+                f"""
+output_dir: {temp_dir.name}
+capture:
+  mode: metadata
+  frequency: {frequency}
+""".lstrip(),
+                encoding="utf-8",
+            )
+
+        def target(x):
+            return x
+
+        write_config(10)
+        with fake_torch_module():
+            wrapped = tensor_args.instrument(target, config_path=config_path)
+            wrapped(FakeTensor((1,)))
+
+            write_config(1)
+            before = tensor_args._signal_dispatch_count()
+            signal.raise_signal(signal.SIGUSR1)
+            self.assertTrue(
+                tensor_args._wait_for_signal_dispatch(before, timeout=5.0)
+            )
+            wrapped(FakeTensor((2,)))
+
+        _record_file, records = self._records(temp_dir.name)
+        self.assertEqual([record["call_index"] for record in records], [2])
+
+    @unittest.skipUnless(
+        hasattr(signal, "SIGUSR1") and hasattr(signal, "raise_signal"),
+        "SIGUSR1 is not available on this platform",
+    )
+    def test_sigusr1_can_enable_initially_disabled_config(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        config_path = Path(temp_dir.name) / "capture.yaml"
+
+        def write_config(mode: str) -> None:
+            config_path.write_text(
+                f"""
+output_dir: {temp_dir.name}
+capture:
+  mode: {mode}
+  frequency: 1
+""".lstrip(),
+                encoding="utf-8",
+            )
+
+        def target(x):
+            return x
+
+        write_config("off")
+        with fake_torch_module():
+            wrapped = tensor_args.instrument(target, config_path=config_path)
+            self.assertIsNot(wrapped, target)
+            wrapped(FakeTensor((1,)))
+
+            write_config("metadata")
+            before = tensor_args._signal_dispatch_count()
+            signal.raise_signal(signal.SIGUSR1)
+            self.assertTrue(
+                tensor_args._wait_for_signal_dispatch(before, timeout=5.0)
+            )
+            wrapped(FakeTensor((2,)))
+
+        _record_file, records = self._records(temp_dir.name)
+        self.assertEqual([record["call_index"] for record in records], [1])
+
+    def test_metadata_records_flush_periodically(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        original_interval = tensor_args.DEFAULT_METADATA_FLUSH_INTERVAL_SECONDS
+
+        def target(x):
+            return x
+
+        try:
+            tensor_args.DEFAULT_METADATA_FLUSH_INTERVAL_SECONDS = 0.01
+            with fake_torch_module(), patched_env(
+                FUNC_CAPTURE_OUTPUT_DIR=temp_dir.name,
+                FUNC_CAPTURE_FULL_EVERY_N=0,
+            ):
+                wrapped = tensor_args.instrument(target)
+                wrapped(FakeTensor((1,)))
+
+                deadline = time.time() + 1.0
+                record_files = []
+                while time.time() < deadline:
+                    record_files = list(Path(temp_dir.name).glob("*/calls.*.jsonl"))
+                    if record_files:
+                        break
+                    time.sleep(0.01)
+        finally:
+            tensor_args.DEFAULT_METADATA_FLUSH_INTERVAL_SECONDS = original_interval
+
+        self.assertEqual(len(record_files), 1)
+        records = [
+            json.loads(line)
+            for line in record_files[0].read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual([record["call_index"] for record in records], [1])
+
+    def test_mode_tensors_without_frequency_uses_sparse_full_default(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        config_path = Path(temp_dir.name) / "capture.yaml"
+        config_path.write_text(
+            "capture:\n  mode: metadata_and_tensors\n",
+            encoding="utf-8",
+        )
+
+        # Snapshots explicitly disabled in the environment, mode asks for
+        # tensors but gives no cadence: full capture must fall back to the sparse
+        # DEFAULT_FULL_EVERY_N, not to the every-call metadata default.
+        with patched_env(FUNC_CAPTURE_FULL_EVERY_N="0"):
+            config = tensor_args._read_config(config_path)
+
+        self.assertEqual(config.full_every_n, tensor_args.DEFAULT_FULL_EVERY_N)
+        self.assertEqual(
+            config.metadata_every_n, tensor_args.DEFAULT_METADATA_EVERY_N
+        )
+
+    def test_bare_frequency_does_not_change_snapshot_cadence(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        config_path = Path(temp_dir.name) / "capture.yaml"
+        config_path.write_text(
+            "capture:\n  frequency: 5\n",
+            encoding="utf-8",
+        )
+
+        # A bare frequency thins metadata only; the snapshot cadence stays at the
+        # environment/base value instead of being silently pulled down to 5.
+        with patched_env(FUNC_CAPTURE_FULL_EVERY_N="200"):
+            config = tensor_args._read_config(config_path)
+
+        self.assertEqual(config.metadata_every_n, 5)
+        self.assertEqual(config.full_every_n, 200)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "fork is not available")
+    def test_capture_works_in_forked_child(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+
+        def target(x):
+            return x
+
+        with fake_torch_module(), patched_env(
+            FUNC_CAPTURE_OUTPUT_DIR=temp_dir.name,
+            FUNC_CAPTURE_FULL_EVERY_N=0,
+        ):
+            wrapped = tensor_args.instrument(target)
+            wrapped(FakeTensor((1,)))
+
+            pid = os.fork()
+            if pid == 0:  # pragma: no cover - runs only in the forked child.
+                exit_code = 0
+                try:
+                    wrapped(FakeTensor((2,)))
+                    tensor_args._flush_all_capture_states()
+                except BaseException:
+                    exit_code = 1
+                finally:
+                    os._exit(exit_code)
+
+            deadline = time.time() + 10.0
+            status = None
+            while time.time() < deadline:
+                waited_pid, waited_status = os.waitpid(pid, os.WNOHANG)
+                if waited_pid == pid:
+                    status = waited_status
+                    break
+                time.sleep(0.02)
+
+            if status is None:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                self.fail("forked child hung (fork deadlock in capture runtime)")
+
+            self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+
+        tensor_args._flush_all_capture_states()
+        # The child wrote its own pid-scoped records file without clobbering the
+        # parent's buffered records; both should be present after flushing.
+        record_files = sorted(Path(temp_dir.name).glob("*/calls.*.jsonl"))
+        self.assertEqual(len(record_files), 2)
 
     def _records(self, temp_dir):
+        self._flush_capture_states()
         record_files = list(Path(temp_dir).glob("*/calls.*.jsonl"))
         self.assertEqual(len(record_files), 1)
         return record_files[0], [
             json.loads(line)
             for line in record_files[0].read_text(encoding="utf-8").splitlines()
         ]
+
+    def _flush_capture_states(self) -> None:
+        # ``capture()`` execs the instrument script into a distinct module
+        # object, so runtimes may be registered in a different copy of this
+        # module than the one imported here. Flush every loaded copy.
+        target = Path(tensor_args.__file__).resolve()
+        for module in list(sys.modules.values()):
+            module_file = getattr(module, "__file__", None)
+            if module_file is None or Path(module_file).resolve() != target:
+                continue
+            flush = getattr(module, "_flush_all_capture_states", None)
+            if callable(flush):
+                flush()
 
     def test_apply_defaults_records_omitted_default_arguments(self) -> None:
         temp_dir = tempfile.TemporaryDirectory()
