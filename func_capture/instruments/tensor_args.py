@@ -7,13 +7,9 @@ This file is an instrumentation script for ``func_capture.capture``. Example:
     export FUNC_CAPTURE_FULL_EVERY_N=100
 
 For every call, the wrapper appends a JSONL record containing non-tensor
-arguments and tensor metadata. Each record also carries per-call *symbolic*
-shapes: concrete dimensions are assigned fresh occurrence symbols (``d0``,
-``d1``, ...), and dimensions that are themselves symbolic (e.g. ``SymInt`` under
-tracing) are recorded by their string representation rather than forced to
-``int``. Every ``FUNC_CAPTURE_FULL_EVERY_N`` calls, it also writes a ``.pt``
-snapshot of the pre-call positional and keyword arguments with tensors copied to
-CPU.
+arguments and tensor metadata. Every ``FUNC_CAPTURE_FULL_EVERY_N`` calls, it
+also writes a ``.pt`` snapshot of the pre-call positional and keyword arguments
+with tensors copied to CPU.
 """
 
 from __future__ import annotations
@@ -288,9 +284,8 @@ def _call_record(
     capture_error: Optional[dict[str, str]],
 ) -> dict[str, Any]:
     bound = _bind_arguments(signature, args, kwargs)
-    symbolizer = _ShapeSymbolizer()
     arguments = {
-        name: _value_metadata(value, symbolizer=symbolizer, path=name)
+        name: _value_metadata(value, path=name)
         for name, value in bound.items()
     }
 
@@ -305,7 +300,6 @@ def _call_record(
         "process_id": os.getpid(),
         "thread_id": threading.get_ident(),
         "arguments": arguments,
-        "tensor_shape_symbols": symbolizer.values_by_symbol,
     }
     if full_capture is not None:
         record["full_capture"] = full_capture
@@ -337,13 +331,12 @@ def _bind_arguments(
 def _value_metadata(
     value: Any,
     *,
-    symbolizer: "_ShapeSymbolizer",
     path: str,
     depth: int = 0,
     seen: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     if _is_tensor(value):
-        return _tensor_metadata(value, symbolizer=symbolizer)
+        return _tensor_metadata(value)
 
     if depth >= MAX_CAPTURE_DEPTH:
         return {"kind": "truncated", "type": _type_name(value), "reason": "max_depth"}
@@ -362,7 +355,6 @@ def _value_metadata(
                     _json_friendly_value(key),
                     _value_metadata(
                         child,
-                        symbolizer=symbolizer,
                         path=f"{path}.{key}",
                         depth=depth + 1,
                         seen=seen,
@@ -379,7 +371,6 @@ def _value_metadata(
             "items": [
                 _value_metadata(
                     child,
-                    symbolizer=symbolizer,
                     path=f"{path}_{index}",
                     depth=depth + 1,
                     seen=seen,
@@ -395,7 +386,6 @@ def _value_metadata(
             "items": [
                 _value_metadata(
                     child,
-                    symbolizer=symbolizer,
                     path=f"{path}_{index}",
                     depth=depth + 1,
                     seen=seen,
@@ -411,13 +401,12 @@ def _value_metadata(
     }
 
 
-def _tensor_metadata(value: Any, *, symbolizer: "_ShapeSymbolizer") -> dict[str, Any]:
+def _tensor_metadata(value: Any) -> dict[str, Any]:
     shape = _tensor_shape(value)
     stride = _tensor_stride(value)
     metadata: dict[str, Any] = {
         "kind": "tensor",
         "shape": shape,
-        "symbolic_shape": [symbolizer.symbol_for(dim) for dim in shape],
         "dtype": str(getattr(value, "dtype", "")),
         "device": str(getattr(value, "device", "")),
         "layout": str(getattr(value, "layout", "")),
@@ -430,25 +419,6 @@ def _tensor_metadata(value: Any, *, symbolizer: "_ShapeSymbolizer") -> dict[str,
     if storage_offset is not None:
         metadata["storage_offset"] = _coerce_dim(storage_offset)
     return metadata
-
-
-class _ShapeSymbolizer:
-    def __init__(self) -> None:
-        self._values_by_symbol: dict[str, Any] = {}
-        self._next_generated = 0
-
-    @property
-    def values_by_symbol(self) -> dict[str, Any]:
-        return dict(self._values_by_symbol)
-
-    def symbol_for(self, dim: Any) -> str:
-        if not isinstance(dim, int) or isinstance(dim, bool):
-            return str(dim)
-
-        symbol = f"d{self._next_generated}"
-        self._next_generated += 1
-        self._values_by_symbol[symbol] = dim
-        return symbol
 
 
 def _save_full_call(
@@ -479,7 +449,7 @@ def _save_full_call(
 def _saved_value(value: Any, depth: int = 0, seen: tuple[int, ...] = ()) -> Any:
     if _is_tensor(value):
         copied = _copy_tensor_to_cpu(value)
-        metadata = _tensor_metadata(value, symbolizer=_ShapeSymbolizer())
+        metadata = _tensor_metadata(value)
         _reconcile_saved_metadata(metadata, copied)
         return {
             TENSOR_MARKER: True,
@@ -606,8 +576,8 @@ def _copy_tensor_to_cpu(value: Any) -> Any:
 
         # Preserve the exact strided layout only when it is safe: an overlapping
         # (e.g. broadcast/expanded, stride-0) tensor cannot be copied into an
-        # equally strided destination without undefined behaviour, and a
-        # symbolic shape/stride cannot be passed to ``empty_strided`` at all.
+        # equally strided destination without undefined behaviour, and
+        # non-integer shape/stride values cannot be passed to ``empty_strided``.
         if (
             torch is not None
             and stride is not None
@@ -690,8 +660,8 @@ def _get_torch() -> Any:
 
 def _coerce_dim(dim: Any) -> Any:
     # Concrete Python sizes/strides stay plain ints. Non-int shape objects are
-    # deliberately not coerced through int(): for torch.SymInt that can
-    # materialise/specialise a dynamic dimension.
+    # stringified so metadata remains JSON-serialisable without invoking
+    # ``__int__``.
     if isinstance(dim, int) and not isinstance(dim, bool):
         return dim
     return str(dim)

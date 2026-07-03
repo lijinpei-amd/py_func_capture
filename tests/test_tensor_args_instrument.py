@@ -17,12 +17,12 @@ from func_capture.instruments import tensor_args
 Plan = collections.namedtuple("Plan", ["count", "tensor"])
 
 
-class FakeSymInt:
+class FakeDynamicDim:
     def __init__(self, name: str) -> None:
         self.name = name
 
     def __int__(self) -> int:
-        raise AssertionError("symbolic dimensions must not be coerced to int")
+        raise AssertionError("non-int dimensions must not be coerced to int")
 
     def __str__(self) -> str:
         return self.name
@@ -223,17 +223,8 @@ class TensorArgsInstrumentTests(unittest.TestCase):
             second_call = records[1]
             self.assertEqual(second_call["arguments"]["ratio"]["value"], 2)
             self.assertEqual(second_call["arguments"]["overlap"]["value"], True)
-            kv_dim_symbol = second_call["arguments"]["kv"]["symbolic_shape"][1]
-            ape_dim_symbol = second_call["arguments"]["ape"]["symbolic_shape"][1]
-            ape_ratio_symbol = second_call["arguments"]["ape"]["symbolic_shape"][0]
-            write_plan_n_symbol = second_call["arguments"]["write_plan"]["symbolic_shape"][0]
-            self.assertNotEqual(ape_ratio_symbol, "ratio")
-            self.assertNotEqual(write_plan_n_symbol, "num_write")
-            self.assertNotEqual(ape_dim_symbol, kv_dim_symbol)
-            self.assertEqual(second_call["tensor_shape_symbols"][ape_ratio_symbol], 2)
-            self.assertEqual(second_call["tensor_shape_symbols"][ape_dim_symbol], 8)
-            self.assertEqual(second_call["tensor_shape_symbols"][kv_dim_symbol], 8)
-            self.assertEqual(second_call["tensor_shape_symbols"][write_plan_n_symbol], 6)
+            self.assertNotIn("tensor_shape_symbols", second_call)
+            self.assertNotIn("symbolic_shape", second_call["arguments"]["kv"])
             self.assertEqual(second_call["arguments"]["kv"]["shape"], [3, 8])
             self.assertEqual(second_call["arguments"]["kv"]["stride"], [16, 1])
 
@@ -412,7 +403,7 @@ class TensorArgsInstrumentTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 tensor_args.instrument(target)
 
-    def test_symbolic_dimensions_are_not_forced_to_int(self) -> None:
+    def test_non_int_dimensions_are_not_forced_to_int(self) -> None:
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
 
@@ -424,14 +415,13 @@ class TensorArgsInstrumentTests(unittest.TestCase):
             FUNC_CAPTURE_FULL_EVERY_N=0,
         ):
             wrapped = tensor_args.instrument(target)
-            wrapped(FakeTensor((FakeSymInt("s0"), 4), stride=(4, 1)))
+            wrapped(FakeTensor((FakeDynamicDim("s0"), 4), stride=(4, 1)))
 
         _, records = self._records(temp_dir.name)
         metadata = records[0]["arguments"]["x"]
         self.assertEqual(metadata["shape"], ["s0", 4])
-        self.assertEqual(metadata["symbolic_shape"][0], "s0")
-        concrete_symbol = metadata["symbolic_shape"][1]
-        self.assertEqual(records[0]["tensor_shape_symbols"][concrete_symbol], 4)
+        self.assertNotIn("symbolic_shape", metadata)
+        self.assertNotIn("tensor_shape_symbols", records[0])
 
     def test_reference_cycle_does_not_recurse_infinitely(self) -> None:
         temp_dir = tempfile.TemporaryDirectory()
