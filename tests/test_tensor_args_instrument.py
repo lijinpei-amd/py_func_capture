@@ -241,6 +241,91 @@ class TensorArgsInstrumentTests(unittest.TestCase):
             self.assertEqual(kwargs["num_write"], 6)
             self.assertEqual(kwargs["ratio"], 2)
 
+    def test_keep_tensors_stubs_unlisted_tensor_arguments(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+
+        def target(w1, routing_data, gather_indx, *, w13_scale):
+            return "called"
+
+        with fake_torch_module(), patched_env(
+            FUNC_CAPTURE_OUTPUT_DIR=temp_dir.name,
+            FUNC_CAPTURE_FULL_EVERY_N=1,
+            FUNC_CAPTURE_KEEP_TENSORS="routing_data, gather_indx",
+        ):
+            wrapped = tensor_args.instrument(target)
+            wrapped(
+                FakeTensor((5, 32, 16), dtype="torch.uint8"),
+                FakeTensor((8, 4)),
+                FakeTensor((32,), dtype="torch.int32"),
+                w13_scale=FakeTensor((5, 2, 16), dtype="torch.uint8"),
+            )
+            tensor_args._flush_all_capture_states()
+
+            full_path = next(Path(temp_dir.name).glob("*/full/*.pt"))
+            snapshot = tensor_args._load_snapshot(full_path)
+            args = snapshot["args"]
+            kwargs = snapshot["kwargs"]
+
+            # w1 and w13_scale are not listed -> metadata-only stubs.
+            self.assertTrue(tensor_args._is_stub_tensor(args[0]))
+            self.assertEqual(args[0]["metadata"]["shape"], [5, 32, 16])
+            self.assertEqual(args[0]["metadata"]["dtype"], "torch.uint8")
+            self.assertNotIn("tensor", args[0])
+            self.assertTrue(tensor_args._is_stub_tensor(kwargs["w13_scale"]))
+
+            # routing_data and gather_indx are listed -> full tensor contents.
+            self.assertTrue(tensor_args._is_saved_tensor(args[1]))
+            self.assertTrue(tensor_args._is_saved_tensor(args[2]))
+
+    def test_keep_tensors_roundtrip_rehydrates_stubs_with_real_torch(self) -> None:
+        import torch
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+
+        def target(w1, routing_data, gather_indx, *, w13_scale):
+            return "called"
+
+        routing = torch.arange(6, dtype=torch.float32)
+        gather = torch.arange(32, dtype=torch.int32)
+        with patched_env(
+            FUNC_CAPTURE_OUTPUT_DIR=temp_dir.name,
+            FUNC_CAPTURE_FULL_EVERY_N=1,
+            FUNC_CAPTURE_KEEP_TENSORS="routing_data,gather_indx",
+        ):
+            wrapped = tensor_args.instrument(target)
+            wrapped(
+                torch.full((5, 32, 16), 7, dtype=torch.uint8),
+                routing,
+                gather,
+                w13_scale=torch.zeros(5, 2, 16, dtype=torch.uint8),
+            )
+            tensor_args._flush_all_capture_states()
+
+            full_path = next(Path(temp_dir.name).glob("*/full/*.pt"))
+            args, kwargs = tensor_args.load_full_call(full_path, tensor_device="cpu")
+
+            # Listed arguments come back byte-for-byte identical.
+            self.assertTrue(torch.equal(args[1], routing))
+            self.assertTrue(torch.equal(args[2], gather))
+
+            # Stubbed arguments come back with the recorded shape/dtype but
+            # synthesized (random) contents rather than the captured value.
+            self.assertEqual(tuple(args[0].shape), (5, 32, 16))
+            self.assertEqual(args[0].dtype, torch.uint8)
+            self.assertEqual(tuple(kwargs["w13_scale"].shape), (5, 2, 16))
+            self.assertEqual(kwargs["w13_scale"].dtype, torch.uint8)
+
+    def test_keep_tensors_env_parses_into_config(self) -> None:
+        with patched_env(FUNC_CAPTURE_KEEP_TENSORS="a, b  c,,d"):
+            config = tensor_args._read_config()
+        self.assertEqual(config.keep_tensors, frozenset({"a", "b", "c", "d"}))
+
+        with patched_env(FUNC_CAPTURE_KEEP_TENSORS=""):
+            config = tensor_args._read_config()
+        self.assertIsNone(config.keep_tensors)
+
     def test_yaml_config_metadata_only_frequency(self) -> None:
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)

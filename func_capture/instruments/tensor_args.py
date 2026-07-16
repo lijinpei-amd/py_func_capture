@@ -53,6 +53,11 @@ OUTPUT_DIR_ENV = "FUNC_CAPTURE_OUTPUT_DIR"
 FULL_EVERY_N_ENV = "FUNC_CAPTURE_FULL_EVERY_N"
 STRICT_ENV = "FUNC_CAPTURE_STRICT"
 CONFIG_PATH_ENV = "FUNC_CAPTURE_CONFIG"
+# Comma/space-separated parameter names whose tensor *contents* are saved in a
+# full snapshot. Any tensor argument not named here is written as a metadata
+# stub (shape/dtype/stride only) and rehydrated with random data on load. When
+# unset, every tensor is saved in full (the original behaviour).
+KEEP_TENSORS_ENV = "FUNC_CAPTURE_KEEP_TENSORS"
 
 DEFAULT_OUTPUT_DIR = "func_capture_out"
 # Writing a full ``.pt`` snapshot copies every tensor argument to CPU, so a
@@ -68,6 +73,13 @@ MAX_CAPTURE_DEPTH = 50
 
 FORMAT_VERSION = 1
 TENSOR_MARKER = "__func_capture_tensor_v1__"
+# A stub records a tensor's shape/dtype/stride/device but *not* its data. It is
+# written for arguments excluded from ``keep_tensors`` so a snapshot can shrink
+# from gigabytes (weights) to kilobytes (routing only). Stubs are rehydrated
+# with random tensors of the recorded spec at load time — enough for a
+# performance replay, where kernel timing depends on shape/dtype/routing, not
+# on the actual weight/activation values.
+TENSOR_STUB_MARKER = "__func_capture_tensor_stub_v1__"
 # Sets are serialised through a marker wrapper: once tensors inside a set are
 # replaced by (unhashable) saved-tensor dicts, the set itself can no longer be
 # rebuilt directly, so we round-trip via an ordered ``items`` list instead.
@@ -80,6 +92,10 @@ class CaptureConfig:
     metadata_every_n: int
     full_every_n: int
     strict: bool
+    # ``None`` means "save every tensor's contents" (original behaviour). A set
+    # (possibly empty) means "save contents only for these parameter names; stub
+    # everything else". Frozen so the dataclass stays hashable.
+    keep_tensors: Optional[frozenset[str]] = None
 
 
 def instrument(
@@ -165,6 +181,13 @@ class _CaptureRuntime:
         _register_capture_state(self)
 
     def capture(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        # Never touch arguments while a CUDA/HIP graph is being captured: reading
+        # tensor contents (repr/json of routing objects) or copying to CPU issues
+        # a disallowed operation that invalidates the capture. Such calls also
+        # replay from the graph without re-entering Python, so recording them is
+        # pointless. Skip entirely and let the eager calls be captured instead.
+        if _is_cuda_graph_capturing():
+            return
         with self._lock:
             self._ensure_process_locked()
             self._start_flusher_thread_locked()
@@ -194,6 +217,8 @@ class _CaptureRuntime:
                     call_index=call_index,
                     args=args,
                     kwargs=kwargs,
+                    signature=self.signature,
+                    keep_tensors=config.keep_tensors,
                 )
                 full_capture = {
                     "path": str(full_path.relative_to(capture_dir)),
@@ -601,6 +626,7 @@ def load_full_call(
     path: Union[os.PathLike[str], str],
     *,
     tensor_device: str = "original",
+    map_location: Any = "cpu",
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
     """Load a full-call snapshot and return replayable ``(args, kwargs)``.
 
@@ -611,9 +637,15 @@ def load_full_call(
       on CPU rather than raising.
     - ``"cpu"``: leave tensors on CPU.
     - any other string: pass it to ``Tensor.to(...)`` as the target device.
+
+    ``map_location`` is forwarded to ``torch.load``. It governs where tensors
+    nested inside *opaque* pickled arguments (e.g. a ``RoutingData`` object)
+    land — the ``tensor_device`` restore only relocates the framework's own
+    saved-tensor wrappers, not tensors hidden inside third-party objects. Set it
+    to the replay device (e.g. ``"cuda:0"``) so those nested tensors are usable.
     """
 
-    snapshot = _load_snapshot(path)
+    snapshot = _load_snapshot(path, map_location=map_location)
     return restore_full_call(snapshot, tensor_device=tensor_device)
 
 
@@ -653,11 +685,13 @@ def _read_config(
     output_dir = Path(os.environ.get(OUTPUT_DIR_ENV, DEFAULT_OUTPUT_DIR)).expanduser()
     strict = _env_bool(STRICT_ENV, default=False)
     full_every_n = _env_int(FULL_EVERY_N_ENV, DEFAULT_FULL_EVERY_N)
+    keep_tensors = _env_name_set(KEEP_TENSORS_ENV)
     config = CaptureConfig(
         output_dir=output_dir,
         metadata_every_n=DEFAULT_METADATA_EVERY_N,
         full_every_n=full_every_n,
         strict=strict,
+        keep_tensors=keep_tensors,
     )
 
     effective_config_path = config_path
@@ -767,11 +801,21 @@ def _apply_yaml_config(base: CaptureConfig, path: Path) -> CaptureConfig:
     if explicit_full_every_n is not _MISSING:
         full_every_n = _coerce_int(explicit_full_every_n, "full_every_n")
 
+    keep_tensors = base.keep_tensors
+    keep_tensors_value = _config_value(
+        root,
+        capture_section,
+        ("keep_tensors", "keep_tensor_contents", "full_tensors"),
+    )
+    if keep_tensors_value is not _MISSING:
+        keep_tensors = _coerce_name_set(keep_tensors_value, "keep_tensors")
+
     return CaptureConfig(
         output_dir=output_dir,
         metadata_every_n=metadata_every_n,
         full_every_n=full_every_n,
         strict=strict,
+        keep_tensors=keep_tensors,
     )
 
 
@@ -897,6 +941,29 @@ def _env_int(name: str, default: int) -> int:
     if value is None or not value.strip():
         return default
     return _coerce_int(value, name)
+
+
+def _env_name_set(name: str) -> Optional[frozenset[str]]:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    return _coerce_name_set(value, name)
+
+
+def _coerce_name_set(value: Any, name: str) -> frozenset[str]:
+    if isinstance(value, str):
+        parts = re.split(r"[,\s]+", value.strip())
+        return frozenset(part for part in parts if part)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        names: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError(f"{name} entries must be strings, got {item!r}")
+            item = item.strip()
+            if item:
+                names.append(item)
+        return frozenset(names)
+    raise ValueError(f"{name} must be a string or list of strings, got {value!r}")
 
 
 def _env_bool(name: str, *, default: bool) -> bool:
@@ -1114,7 +1181,21 @@ def _save_full_call(
     call_index: int,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
+    signature: Optional[inspect.Signature] = None,
+    keep_tensors: Optional[frozenset[str]] = None,
 ) -> None:
+    # When ``keep_tensors`` is set, only arguments whose (bound) parameter name
+    # is listed keep their tensor contents; all other tensors are written as
+    # metadata-only stubs. ``keep_tensors is None`` preserves everything.
+    positional_names = _positional_param_names(signature)
+
+    def save_arg(index: int, value: Any) -> Any:
+        name = positional_names[index] if index < len(positional_names) else None
+        return _saved_value_with_policy(value, _keep_real(name, keep_tensors))
+
+    def save_kwarg(name: str, value: Any) -> Any:
+        return _saved_value_with_policy(value, _keep_real(name, keep_tensors))
+
     snapshot = {
         "version": FORMAT_VERSION,
         "function": function_key,
@@ -1123,12 +1204,73 @@ def _save_full_call(
         "call_index": call_index,
         "time_ns": time.time_ns(),
         "process_id": os.getpid(),
-        "args": tuple(_saved_value(value) for value in args),
-        "kwargs": {key: _saved_value(value) for key, value in kwargs.items()},
+        "args": tuple(save_arg(index, value) for index, value in enumerate(args)),
+        "kwargs": {key: save_kwarg(key, value) for key, value in kwargs.items()},
     }
     tmp_path = path.with_name(f"{path.name}.tmp")
     _save_snapshot(snapshot, tmp_path)
     os.replace(tmp_path, path)
+
+
+def _keep_real(name: Optional[str], keep_tensors: Optional[frozenset[str]]) -> bool:
+    if keep_tensors is None:
+        return True
+    return name is not None and name in keep_tensors
+
+
+def _positional_param_names(signature: Optional[inspect.Signature]) -> list[str]:
+    if signature is None:
+        return []
+    names: list[str] = []
+    for param in signature.parameters.values():
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            names.append(param.name)
+        elif param.kind is inspect.Parameter.VAR_POSITIONAL:
+            # Positional args beyond this point can't be name-mapped; stop so
+            # they fall through to the "unknown name" (stub-if-filtering) case.
+            break
+    return names
+
+
+def _saved_value_with_policy(value: Any, keep_real: bool) -> Any:
+    return _saved_value(value) if keep_real else _stub_value(value)
+
+
+def _stub_value(value: Any, depth: int = 0, seen: tuple[int, ...] = ()) -> Any:
+    """Like ``_saved_value`` but tensors become metadata-only stubs.
+
+    Container structure and non-tensor leaves are preserved so a stubbed
+    argument still reconstructs with the right shape (e.g. a list of tensors).
+    """
+
+    if _is_tensor(value):
+        return {TENSOR_STUB_MARKER: True, "metadata": _tensor_metadata(value)}
+
+    if depth >= MAX_CAPTURE_DEPTH:
+        return _safe_repr(value)
+
+    if isinstance(value, (Mapping, list, tuple, set, frozenset)):
+        if id(value) in seen:
+            return _safe_repr(value)
+        seen = seen + (id(value),)
+
+    if isinstance(value, Mapping):
+        return {key: _stub_value(child, depth + 1, seen) for key, child in value.items()}
+    if _is_namedtuple(value):
+        return type(value)(*(_stub_value(child, depth + 1, seen) for child in value))
+    if isinstance(value, list):
+        return [_stub_value(child, depth + 1, seen) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_stub_value(child, depth + 1, seen) for child in value)
+    if isinstance(value, (set, frozenset)):
+        return {
+            SET_MARKER: "frozenset" if isinstance(value, frozenset) else "set",
+            "items": [_stub_value(child, depth + 1, seen) for child in value],
+        }
+    return value
 
 
 def _saved_value(value: Any, depth: int = 0, seen: tuple[int, ...] = ()) -> Any:
@@ -1183,6 +1325,8 @@ def _restore_saved_value(value: Any, tensor_device: str) -> Any:
             except RuntimeError:
                 pass
         return tensor
+    if _is_stub_tensor(value):
+        return _synthesize_tensor(value.get("metadata", {}), tensor_device)
     if _is_saved_set(value):
         items = [_restore_saved_value(child, tensor_device) for child in value["items"]]
         return frozenset(items) if value[SET_MARKER] == "frozenset" else set(items)
@@ -1217,6 +1361,119 @@ def _is_saved_tensor(value: Any) -> bool:
         and "tensor" in value
         and "metadata" in value
     )
+
+
+def _is_stub_tensor(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get(TENSOR_STUB_MARKER) is True
+        and "metadata" in value
+    )
+
+
+def _synthesize_tensor(metadata: Mapping[str, Any], tensor_device: str) -> Any:
+    """Build a random tensor matching a stub's recorded shape/dtype/layout.
+
+    Contents are random because a performance replay only needs the kernel to
+    see the right shapes, dtypes, strides, and device — not the original data.
+    """
+
+    torch = _get_torch()
+    if torch is None:
+        raise RuntimeError("torch is required to rehydrate a tensor stub")
+
+    shape = metadata.get("shape", [])
+    if not _all_ints(shape):
+        raise ValueError(
+            f"cannot synthesize a tensor for stub with non-integer shape {shape!r}"
+        )
+    dtype = _parse_dtype(torch, metadata.get("dtype"))
+    device = _target_device(metadata, tensor_device) or "cpu"
+
+    stride = metadata.get("stride")
+    storage_offset = metadata.get("storage_offset", 0)
+    use_strided = (
+        isinstance(stride, list)
+        and _all_ints(stride)
+        and isinstance(storage_offset, int)
+        and not _is_contiguous_stride(shape, stride)
+        and not _strided_overlaps(shape, stride)
+    )
+
+    try:
+        if use_strided:
+            span = storage_offset + _strided_storage_span(shape, stride)
+            flat = _random_tensor(torch, [span], dtype, device)
+            tensor = torch.as_strided(flat, tuple(shape), tuple(stride), storage_offset)
+        else:
+            tensor = _random_tensor(torch, shape, dtype, device)
+    except Exception:
+        # Recorded device/layout unavailable here; fall back to a plain CPU
+        # tensor of the right shape/dtype rather than failing the replay.
+        tensor = _random_tensor(torch, shape, dtype, "cpu")
+
+    if metadata.get("requires_grad") and getattr(tensor, "is_floating_point", None):
+        try:
+            if tensor.is_floating_point():
+                tensor = tensor.requires_grad_(True)
+        except (RuntimeError, AttributeError):
+            pass
+    return tensor
+
+
+def _random_tensor(torch: Any, shape: Any, dtype: Any, device: str) -> Any:
+    shape = tuple(shape)
+    if dtype is None:
+        return torch.zeros(shape, device=device)
+    if dtype is torch.bool:
+        return torch.randint(0, 2, shape, device=device, dtype=torch.bool)
+    if getattr(dtype, "is_floating_point", False):
+        try:
+            return torch.randn(shape, device=device, dtype=dtype)
+        except (RuntimeError, TypeError):
+            # Some low-precision float dtypes (fp8 variants) don't support randn
+            # directly; generate in float32 and cast.
+            return torch.randn(shape, device=device, dtype=torch.float32).to(dtype)
+    if getattr(dtype, "is_complex", False):
+        return torch.randn(shape, device=device, dtype=dtype)
+    # Integer / unsigned dtypes: fill the low byte so values stay valid for
+    # every width (uint8 packed MXFP4, index-like ints, etc.).
+    high = 256 if dtype is torch.uint8 else 128
+    return torch.randint(0, high, shape, device=device, dtype=dtype)
+
+
+def _parse_dtype(torch: Any, dtype_str: Any) -> Any:
+    if not isinstance(dtype_str, str) or not dtype_str:
+        return None
+    name = dtype_str[len("torch.") :] if dtype_str.startswith("torch.") else dtype_str
+    dtype = getattr(torch, name, None)
+    # Guard against attribute names that aren't actually dtypes.
+    if dtype is not None and type(dtype).__name__ == "dtype":
+        return dtype
+    return None
+
+
+def _is_contiguous_stride(shape: list[Any], stride: list[Any]) -> bool:
+    if len(shape) != len(stride):
+        return False
+    expected = 1
+    for dim, dim_stride in zip(reversed(shape), reversed(stride)):
+        if not isinstance(dim, int) or not isinstance(dim_stride, int):
+            return False
+        if dim != 1 and dim_stride != expected:
+            return False
+        expected *= dim if dim > 0 else 1
+    return True
+
+
+def _strided_storage_span(shape: list[Any], stride: list[Any]) -> int:
+    # Number of elements the last valid index reaches (plus one) for a strided
+    # tensor, so the backing storage is large enough for ``as_strided``.
+    span = 1
+    for dim, dim_stride in zip(shape, stride):
+        if dim > 0:
+            span += (dim - 1) * dim_stride
+    return span
 
 
 def _is_saved_set(value: Any) -> bool:
@@ -1310,13 +1567,16 @@ def _save_snapshot(snapshot: Mapping[str, Any], path: Path) -> None:
         pickle.dump(snapshot, file, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def _load_snapshot(path: Union[os.PathLike[str], str]) -> Mapping[str, Any]:
+def _load_snapshot(
+    path: Union[os.PathLike[str], str],
+    map_location: Any = "cpu",
+) -> Mapping[str, Any]:
     torch = _get_torch()
     if torch is not None and hasattr(torch, "load"):
         try:
-            return cast(Mapping[str, Any], torch.load(path, map_location="cpu", weights_only=False))
+            return cast(Mapping[str, Any], torch.load(path, map_location=map_location, weights_only=False))
         except TypeError:
-            return cast(Mapping[str, Any], torch.load(path, map_location="cpu"))
+            return cast(Mapping[str, Any], torch.load(path, map_location=map_location))
     with Path(path).open("rb") as file:
         return cast(Mapping[str, Any], pickle.load(file))
 
@@ -1351,6 +1611,22 @@ def _get_torch() -> Any:
         return importlib.import_module("torch")
     except ImportError:
         return None
+
+
+def _is_cuda_graph_capturing() -> bool:
+    # True while a CUDA/HIP graph capture is in progress on the current stream.
+    # Guarded so the check itself never raises on CPU-only builds or older torch.
+    torch = _get_torch()
+    if torch is None:
+        return False
+    cuda = getattr(torch, "cuda", None)
+    is_capturing = getattr(cuda, "is_current_stream_capturing", None)
+    if not callable(is_capturing):
+        return False
+    try:
+        return bool(is_capturing())
+    except Exception:
+        return False
 
 
 def _coerce_dim(dim: Any) -> Any:

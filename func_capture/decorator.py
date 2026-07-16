@@ -18,6 +18,63 @@ Instrument = Callable[..., Any]
 
 ENV_VAR = "FUNC_CAPTURE"
 
+# ---------------------------------------------------------------------------
+# Env propagation across env-scrubbed subprocesses.
+#
+# Some serving stacks (e.g. ATOM's spawned EngineCore / ModelRunner workers)
+# launch the process that actually runs the instrumented function with a
+# curated environment that does NOT inherit FUNC_CAPTURE*. Because @capture is
+# evaluated at import time in that fresh worker, it would see no FUNC_CAPTURE and
+# silently no-op. To make capture work regardless of env inheritance, any process
+# that DOES have FUNC_CAPTURE snapshots all FUNC_CAPTURE* vars to a file, and a
+# process that is missing FUNC_CAPTURE restores them from that file before
+# deciding whether to instrument. The file path is a fixed default (so a scrubbed
+# child can find it with no env at all) and can be overridden with
+# FUNC_CAPTURE_ENV_FILE. Delete the file to stop propagating.
+import tempfile as _tempfile
+
+_ENV_SNAPSHOT_DEFAULT = os.path.join(_tempfile.gettempdir(), "func_capture_env.json")
+
+
+def _env_snapshot_path() -> str:
+    return os.environ.get("FUNC_CAPTURE_ENV_FILE", _ENV_SNAPSHOT_DEFAULT)
+
+
+def _persist_capture_env() -> None:
+    """Snapshot FUNC_CAPTURE* env vars so env-scrubbed children can restore them."""
+    if ENV_VAR not in os.environ:
+        return
+    snap = {k: v for k, v in os.environ.items() if k.startswith("FUNC_CAPTURE")}
+    try:
+        path = _env_snapshot_path()
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(snap, handle)
+        os.replace(tmp, path)  # atomic
+    except OSError:
+        pass
+
+
+def _restore_capture_env() -> None:
+    """Restore FUNC_CAPTURE* from the snapshot file when this process lacks them."""
+    if ENV_VAR in os.environ:
+        return
+    try:
+        with open(_env_snapshot_path(), encoding="utf-8") as handle:
+            snap = json.load(handle)
+    except (OSError, ValueError):
+        return
+    if not isinstance(snap, dict):
+        return
+    for key, value in snap.items():
+        if isinstance(key, str) and isinstance(value, str):
+            os.environ.setdefault(key, value)
+
+
+# Persist at import from any process that already has the capture config, so the
+# snapshot exists before the (env-scrubbed) worker imports the instrumented module.
+_persist_capture_env()
+
 
 @overload
 def capture(
@@ -91,6 +148,10 @@ def capture(
         func = None
 
     def decorate(target: F) -> F:
+        # Env-scrubbed worker (e.g. spawned model runner): restore FUNC_CAPTURE*
+        # from the snapshot file written by whichever process had the config.
+        if env_var == ENV_VAR:
+            _restore_capture_env()
         if env_var not in os.environ:
             return target
 
